@@ -18,14 +18,14 @@ from threading import Thread
 # CONFIGURAZIONE MODIFICABILE
 # ────────────────────────────────────────────────────────────────────────────────
 TIMEFRAME = "5m"                   #Timeframe delle candele. Valori: 1m;5m;15m;30m;1h;4h;1d;
-START_DATE = "2022-01-01 00:00:00" #Data di inizio in formato UTC
+START_DATE = "2025-01-01 00:00:00" #Data di inizio in formato UTC
 
 BINANCE_SYMBOLS: List[str] = [        #Simboli da scaricare usando Binance
+    "BTC/EUR",
     "ETH/EUR",
     "XRP/EUR",
     "SOL/EUR",
     "BNB/EUR",
-    "BTC/EUR",
     "DOGE/EUR",
     "BAT/BTC",
 ]
@@ -39,6 +39,10 @@ PARTIAL_EVERY     = 10    #Ogni N batch salva un CSV parziale
 MAX_RETRIES       = 3     #Numero massimo di tentativi per lo stesso errore
 RATE_LIMIT_SAFETY = 1.10  #Aggiunge il 10 % al rateLimit dell'exchange
 DEBUG = True              #Attiva o no la visualizzazione dei messaggi di DEBUG
+BREAKPOINT = False         #Attiva o no lo stop ai breakpoint
+DEBUGDF = False           #Attiva o no l'output del Dataframe a ogni operazione
+LOG = True                #Attiva o no il Debug su File
+SHOWCONSOLE = False
 # ────────────────────────────────────────────────────────────────────────────────
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -52,7 +56,13 @@ def debug_print(*args, level="d", **kwargs):
             "e": "[ERROR]:",
         }
         prefix = prefixes.get(level.lower(), "[DEBUG]:")
-        print(prefix, *args, **kwargs)
+        if (SHOWCONSOLE): print(prefix, *args, **kwargs)
+        msg = " ".join(str(a) for a in args)
+        if LOG:
+            with open("log.txt", "a", encoding="utf-8") as f:
+                f.write(f"{prefix} {msg}\n")
+                f.flush()                  # forza flush
+                os.fsync(f.fileno())       # forza scrittura su disco
 
 # ────────────────────────────────────────────────────────────────────────────────
 # ABILITA SEQUENZE ANSI SU WINDOWS (per riscrivere più righe senza scroll)
@@ -96,6 +106,7 @@ last_symbol: str | None = None
 last_timestamp_str: str | None = None
 btc_df= None
 btc_df_lock = threading.Lock()
+btc_price_dict = {}
 # ────────────────────────────────────────────────────────────────────────────────
 # Output multilinea che si sovrascrive (niente scroll)
 # ────────────────────────────────────────────────────────────────────────────────
@@ -124,12 +135,14 @@ def check_escape() -> None:
 # Funzione di caricamento CSV BTC in Dataframe
 # ────────────────────────────────────────────────────────────────────────────────
 def load_btc_csv():
+    debug_print("Thread Load CSV BTC avviato!")
     try:
-        global btc_df
+        global btc_df, btc_price_dict
         path = os.path.join(os.path.dirname(__file__), "BTC.csv")
         df = pd.read_csv(path, sep=";", dtype={"timestamp": str})
         with btc_df_lock:
             btc_df = df
+            btc_price_dict = btc_df.set_index("timestamp")["close"].to_dict()
         debug_print("CSV BTC caricato")
     except Exception as e:
         debug_print("Non sono riuscito a caricare il CSV di BTC:\n" + str(e), level="w")
@@ -146,13 +159,14 @@ def load_csv_safe(filename: str) -> pd.DataFrame:
         debug_print("Ho trovato un csv completo.")
         df = pd.read_csv(filename, sep=";")
         df.columns = [c.lower() for c in df.columns]
-        if "timestamp" in df.columns:
+        if "timestamp" in df.columns and not df.empty:
             return df
+        elif df.empty:
+            raise ValueError("CSV senza dati.")
         else:
-            debug_print("Non sono riuscito a decodificare il csv completo.", level="w")
-            return pd.DataFrame()
+            raise ValueError("CSV non formattato corretamente.")
     except Exception as e:
-        debug_print("Non sono riuscito a decodificare il csv completo:\n" + str(e), level="e")
+        debug_print("Non sono riuscito a decodificare il csv completo:\n" + str(e), level="w")
         return pd.DataFrame()
 
 def save_partial(buffer: list, partial_csv: str) -> None:
@@ -199,26 +213,32 @@ def consolidate_csv(full_csv: str, partial_csv: str, convert_btc: bool) -> None:
 #            return pd.NaT
 
 #     df_all["timestamp"] = df_all["timestamp"].apply(parse_timestamp)
-    df_all["timestamp"] = pd.to_datetime(
-        df_all["timestamp"],
-        format="%d/%m/%Y %H:%M",
-        utc=True,
-        errors="coerce"       #Stringhe non valide → NaT
-    )
+
+    if (DEBUGDF): debug_print(df_all.head(3))
+    
+    df_all["timestamp"] = pd.to_datetime(df_all["timestamp"], unit="ms", utc=True)
+    
+    if (DEBUGDF): debug_print("Dopo timestamp to datetime",df_all.head(3))
+    
     df_all.dropna(subset=["timestamp"], inplace=True)
     df_all.sort_values("timestamp", inplace=True)
     df_all["timestamp"] = df_all["timestamp"].dt.strftime("%d/%m/%Y %H:%M")
     debug_print("Formattato correttamente tutti i timestamp.")
+    if (BREAKPOINT): input("Breakpoint")
     
     def get_btc_price(timestamp: str) -> float:
         with btc_df_lock:
             if btc_df is None or btc_df.empty:
                 debug_print ("Dataframe BTC/EUR non caricato correttamente!", level="e")
                 return 1.0
-        row = btc_df[btc_df["timestamp"] == timestamp]
-        if not row.empty:
-            btc_price = row.iloc[0]["close"]
-            return float(str(btc_price).replace(",", "."))
+        #row = btc_df[btc_df["timestamp"] == timestamp]
+        if (BREAKPOINT): input("Breakpoint")
+        price_str = btc_price_dict.get(timestamp)
+        if price_str is not None:
+        #if not row.empty:
+            #btc_price = row.iloc[0]["close"]
+            #return float(str(btc_price).replace(",", "."))
+            return float(str(price_str).replace(",", "."))
         else:
             debug_print(f"Timestamp BTC non trovato: {timestamp}", level="w")
             return 1.0
@@ -228,7 +248,9 @@ def consolidate_csv(full_csv: str, partial_csv: str, convert_btc: bool) -> None:
         try:
             price = float(val)
             if convert_btc and load_btc_csv_thread:
-                if load_btc_csv_thread.is_alive(): load_btc_csv_thread.join()
+                if load_btc_csv_thread.is_alive():
+                    debug_print("Attendo Thread...") 
+                    load_btc_csv_thread.join()
                 btc_price = get_btc_price(timestamp)
                 price *= btc_price
             return f"{price:.2f}".replace(".", ",")
@@ -237,6 +259,7 @@ def consolidate_csv(full_csv: str, partial_csv: str, convert_btc: bool) -> None:
             return val
 
     df_all["close"] = df_all.apply(lambda row: format_close(row["close"], row["timestamp"]), axis=1)
+    if (DEBUGDF): debug_print("Dopo format_close",df_all.head(3))
     debug_print("Formattato e convertiti correttamente tutti i prezzi.")
 
     df_all.to_csv(full_csv, index=False, sep=";")
@@ -291,9 +314,8 @@ def download_symbol(exchange: ccxt.Exchange, symbol: str) -> bool:
     partial_csv = f"{base}_partial.csv"
 
     df_partial = load_csv_safe(partial_csv)
-    df_partial.dropna(subset=["timestamp"], inplace=True)
     df_full= load_csv_safe(full_csv)
-
+    if (BREAKPOINT): input("Breakpoint")
     # — RIPARTENZA —
     if not df_partial.empty:
         ts_val = df_partial.iloc[-1]["timestamp"]
@@ -390,3 +412,18 @@ def download_symbol(exchange: ccxt.Exchange, symbol: str) -> bool:
     consolidate_csv(full_csv, partial_csv, convert_btc)
     print()  # riga vuota
     return True
+# ────────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ────────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    try:
+        for exch, symbols in exchanges.items():
+            for sym in symbols:
+                result = download_symbol(exch, sym)
+                if not result:
+                    print("\nDownload interrotto dall'utente.")
+                    sys.exit(0)
+        print("\nDownload completato!")
+    except KeyboardInterrupt:
+        print("\nEsecuzione interrotta dall'utente.")
+        sys.exit(0)
