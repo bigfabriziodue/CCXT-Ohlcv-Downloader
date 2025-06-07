@@ -8,10 +8,13 @@ import shutil
 import ctypes
 import argparse
 import glob
+import threading
 from datetime import datetime, timezone
 from typing import List
 from datetime import timedelta
-import threading
+from pandas._libs.tslibs.nattype import NaTType
+from threading import Thread
+
 # ────────────────────────────────────────────────────────────────────────────────
 # CONFIGURAZIONE MODIFICABILE
 # ────────────────────────────────────────────────────────────────────────────────
@@ -132,7 +135,8 @@ def load_btc_csv():
         debug_print("CSV BTC caricato")
     except Exception as e:
         debug_print("Non sono riuscito a caricare il CSV di BTC:\n" + str(e), level="w")
-    
+
+load_btc_csv_thread = Thread(target = load_btc_csv)
 # ────────────────────────────────────────────────────────────────────────────────
 # Utility lettura/scrittura CSV
 # ────────────────────────────────────────────────────────────────────────────────
@@ -187,153 +191,59 @@ def consolidate_csv(full_csv: str, partial_csv: str, convert_btc: bool) -> None:
 
     df_all = pd.concat(frames, ignore_index=True).drop_duplicates(subset="timestamp")
 
-    def parse_timestamp(ts):
-        try:
-            if isinstance(ts, (int, float)):
-                return datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
-            return datetime.strptime(str(ts), "%d/%m/%Y %H:%M")
-        except Exception as e:
-            debug_print(f"Timestamp non valido durante il parsing: {ts} - {e}", level="w")
-            return pd.NaT
+#    def parse_timestamp(ts) -> Union[datetime, NaTType]:
+#        try:
+#            if isinstance(ts, (int, float)):
+#                return datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
+#            return datetime.strptime(str(ts), "%d/%m/%Y %H:%M")
+#        except Exception as e:
+#            debug_print(f"Timestamp non valido durante il parsing: {ts} - {e}", level="w")
+#            return pd.NaT
 
-    df_all["timestamp"] = df_all["timestamp"].apply(parse_timestamp)
+#     df_all["timestamp"] = df_all["timestamp"].apply(parse_timestamp)
+    df_all["timestamp"] = pd.to_datetime(
+        df_all["timestamp"],
+        format="%d/%m/%Y %H:%M",
+        utc=True,
+        errors="coerce"       #Stringhe non valide → NaT
+    )
     df_all.dropna(subset=["timestamp"], inplace=True)
     df_all.sort_values("timestamp", inplace=True)
     df_all["timestamp"] = df_all["timestamp"].dt.strftime("%d/%m/%Y %H:%M")
+    debug_print("Formattato correttamente tutti i timestamp.")
     
-    def get_btc_price(timestamp)
+    def get_btc_price(timestamp: str) -> float:
+        with btc_df_lock:
+            if btc_df is None or btc_df.empty:
+                debug_print ("Dataframe BTC/EUR non caricato correttamente!", level="e")
+                return 1.0
+        row = btc_df[btc_df["timestamp"]== timestamp]
+        if not row.empty:
+            btc_price = row.iloc[0]["close"]
+            return float(str(btc_price).replace(",", "."))
+        else:
+            debug_print(f"Timestamp BTC non trovato: {timestamp}", level="w")
+            return 1.0
+        
 
     def format_close(val, timestamp):
         try:
             price = float(val)
-            if convert_btc:
+            if convert_btc and load_btc_csv_thread:
+                if load_btc_csv_thread.is_alive(): load_btc_csv_thread.join()
                 btc_price = get_btc_price(timestamp)
                 price *= btc_price
             return f"{price:.2f}".replace(".", ",")
         except Exception as e:
-            debug_print("Non sono riuscito a formattare {price}:\n" + str(e), level="w")
+            debug_print(f"Non sono riuscito a formattare {val} in {timestamp}:\n" + str(e), level="w")
             return val
 
     df_all["close"] = df_all.apply(lambda row: format_close(row["close"], row["timestamp"]), axis=1)
+    debug_print("Formattato e convertiti correttamente tutti i prezzi.")
 
     df_all.to_csv(full_csv, index=False, sep=";")
 
     if os.path.exists(partial_csv):
         os.remove(partial_csv)
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Download singolo simbolo
-# ────────────────────────────────────────────────────────────────────────────────
-def download_symbol(exchange: ccxt.Exchange, symbol: str) -> bool:
-    global current_pair_idx, stop_flag, last_symbol, last_timestamp_str
-
-    current_pair_idx += 1
-    last_symbol = symbol
-    last_timestamp_str = None
-    convert_btc = "/BTC" in symbol
-    if (convert_btc):
-        
-
-    base = symbol.split("/")[0]
-    full_csv    = f"{base}.csv"
-    partial_csv = f"{base}_partial.csv"
-
-    df_partial = load_csv_safe(partial_csv)
-    df_full    = load_csv_safe(full_csv)
-
-    # — RIPARTENZA —
-    if not df_partial.empty:
-        ts_val = df_partial.iloc[-1]["timestamp"]
-        if pd.api.types.is_numeric_dtype(df_partial["timestamp"]):
-            since = int(ts_val) + timeframe_ms
-            last_timestamp_str = datetime.fromtimestamp(int(ts_val) / 1000, tz=timezone.utc).strftime("%d/%m/%Y %H:%M")
-        else:
-            dt = datetime.strptime(str(ts_val), "%d/%m/%Y %H:%M")
-            since = int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000) + timeframe_ms
-            last_timestamp_str = str(ts_val)
-        print(f"\nRiprendo {symbol} con timeframe {TIMEFRAME} da timestamp {last_timestamp_str} (parziale)")
-
-    elif not df_full.empty:
-        answer = input(f"Trovato file completo per {symbol}. Vuoi aggiornarlo? (s/n): ").strip().lower()
-        if answer != "s":
-            print(f"Salto aggiornamento {symbol}.")
-            return True
-
-        since = full_to_partial_conversion(full_csv, partial_csv) + timeframe_ms
-        last_timestamp_str = df_full.iloc[-1]["timestamp"]
-        print(f"\nAggiornamento {symbol} dal {last_timestamp_str} con timeframe {TIMEFRAME}")
-
-    else:
-        since = start_ts_ms
-        print(f"\nNessun file precedente per {symbol}, parto con timeframe {TIMEFRAME} da {START_DATE}")
-
-    buffer: list = []
-    batch_counter = 0
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    retry_count = 0
-    rate_limit_s = (getattr(exchange, "rateLimit", 1000) / 1000.0) * RATE_LIMIT_SAFETY
-
-    while since < now_ms:
-        check_escape()
-        if stop_flag:
-            break
-
-        t0 = time.time()
-        try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME,
-                                         since=since, limit=BATCH_LIMIT)
-            retry_count = 0
-        except Exception as e:
-            if buffer:
-                save_partial(buffer, partial_csv)
-                buffer.clear()
-            retry_count += 1
-            progress_print([
-                f"ERRORE ({retry_count}/{MAX_RETRIES}) su {symbol}: {e}",
-                "Ritentativo tra 5 s…",
-            ])
-            if retry_count >= MAX_RETRIES:
-                print(f"\nInterrotto: impossibile proseguire per errore: {e}")
-                return False
-            time.sleep(5)
-            continue
-
-        if not ohlcv:
-            break
-
-        for ts, _, _, _, close, *_ in ohlcv:
-            buffer.append([ts, close])
-            last_timestamp_str = datetime.fromtimestamp(ts / 1000,
-                                tz=timezone.utc).strftime("%d/%m/%Y %H:%M")
-
-        last_ts = ohlcv[-1][0]
-        since   = last_ts + timeframe_ms
-        batch_counter += 1
-
-        pair_progress    = (last_ts - start_ts_ms) / (now_ms - start_ts_ms)
-        overall_progress = (current_pair_idx - 1 + pair_progress) / total_pairs
-        progress_print([
-            f"Operazione {current_pair_idx}/{total_pairs}:",
-            f"Coppia attuale: {symbol}",
-            f"Recuperate {len(ohlcv)} candele - {last_timestamp_str}",
-            f"Completato: {overall_progress * 100:6.2f} %",
-        ])
-
-        if batch_counter % PARTIAL_EVERY == 0:
-            save_partial(buffer, partial_csv)
-            buffer.clear()
-
-        elapsed = time.time() - t0
-        time.sleep(max(0.0, rate_limit_s - elapsed))
-
-    if stop_flag:
-        if buffer:
-            save_partial(buffer, partial_csv)
-        return False
-
-    if buffer:
-        save_partial(buffer, partial_csv)
-
-    consolidate_csv(full_csv, partial_csv, convert_btc)
-    print()  # riga vuota
-    return True
+    
+load_btc_csv_thread.start()
