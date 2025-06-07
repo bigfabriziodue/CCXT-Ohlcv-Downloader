@@ -12,7 +12,6 @@ import threading
 from datetime import datetime, timezone
 from typing import List
 from datetime import timedelta
-from pandas._libs.tslibs.nattype import NaTType
 from threading import Thread
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -83,8 +82,7 @@ timeframe_to_milliseconds = {
 }
 
 timeframe_ms = timeframe_to_milliseconds.get(TIMEFRAME)
-if timeframe_ms is None:
-    raise ValueError(f"Timeframe non supportato: {TIMEFRAME}")
+
 
 binance = ccxt.binance({"enableRateLimit": True})
 cryptocom  = ccxt.cryptocom({"enableRateLimit": True})
@@ -217,7 +215,7 @@ def consolidate_csv(full_csv: str, partial_csv: str, convert_btc: bool) -> None:
             if btc_df is None or btc_df.empty:
                 debug_print ("Dataframe BTC/EUR non caricato correttamente!", level="e")
                 return 1.0
-        row = btc_df[btc_df["timestamp"]== timestamp]
+        row = btc_df[btc_df["timestamp"] == timestamp]
         if not row.empty:
             btc_price = row.iloc[0]["close"]
             return float(str(btc_price).replace(",", "."))
@@ -245,5 +243,150 @@ def consolidate_csv(full_csv: str, partial_csv: str, convert_btc: bool) -> None:
 
     if os.path.exists(partial_csv):
         os.remove(partial_csv)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Conversione: completo → parziale
+# ────────────────────────────────────────────────────────────────────────────────
+
+def full_to_partial_conversion(full_csv: str, partial_csv: str) -> int:
+    try:
+        print(f"Conversione {full_csv} → {partial_csv} (ripartenza)...")
+        df_full = pd.read_csv(full_csv, sep=";")
+        
+        df_full["timestamp"] = pd.to_datetime(
+            df_full["timestamp"],
+            format="%d/%m/%Y %H:%M",
+            utc=True,
+            errors="coerce"       #Stringhe non valide → NaT
+        )
+        df_full.dropna(subset=["timestamp"], inplace=True)
+        df_full["timestamp"] = (df_full["timestamp"].astype(int) // 10**6)
+        
+        df_full["close"] = df_full["close"].str.replace(",", ".").astype(float)
+        df_full.to_csv(partial_csv, index=False, sep=";")
+        
+        if df_full.empty:
+             raise ValueError(f"{partial_csv} non risulta essere riconvertito correttamente!")
+        return int(df_full.iloc[-1]["timestamp"])
+    except Exception as e:
+        debug_print(e, level="e")
+        return 0
+# ────────────────────────────────────────────────────────────────────────────────
+# Download singolo simbolo
+# ────────────────────────────────────────────────────────────────────────────────
+def download_symbol(exchange: ccxt.Exchange, symbol: str) -> bool:
+    global current_pair_idx, stop_flag, last_symbol, last_timestamp_str
     
-load_btc_csv_thread.start()
+    if timeframe_ms is None: raise ValueError(f"Timeframe non supportato: {TIMEFRAME}")
+
+    current_pair_idx += 1
+    last_symbol = symbol
+    last_timestamp_str = None
+    convert_btc = "/BTC" in symbol
+    if convert_btc and (btc_df is None or btc_df.empty) and not load_btc_csv_thread.is_alive():
+        load_btc_csv_thread.start()
+
+    base = symbol.split("/")[0]
+    full_csv    = f"{base}.csv"
+    partial_csv = f"{base}_partial.csv"
+
+    df_partial = load_csv_safe(partial_csv)
+    df_partial.dropna(subset=["timestamp"], inplace=True)
+    df_full= load_csv_safe(full_csv)
+
+    # — RIPARTENZA —
+    if not df_partial.empty:
+        ts_val = df_partial.iloc[-1]["timestamp"]
+        if pd.api.types.is_numeric_dtype(df_partial["timestamp"]):
+            since = int(ts_val) + timeframe_ms
+            last_timestamp_str = datetime.fromtimestamp(int(ts_val) / 1000, tz=timezone.utc).strftime("%d/%m/%Y %H:%M")
+        else:
+            dt = datetime.strptime(str(ts_val), "%d/%m/%Y %H:%M")
+            since = int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000) + timeframe_ms
+            last_timestamp_str = str(ts_val)
+        print(f"\nRiprendo {symbol} con timeframe {TIMEFRAME} da timestamp {last_timestamp_str} (parziale)")
+
+    elif not df_full.empty:
+        answer = input(f"Trovato file completo per {symbol}. Vuoi aggiornarlo? (s/n): ").strip().lower()
+        if answer != "s":
+            print(f"Salto aggiornamento {symbol}.")
+            return True
+
+        since = full_to_partial_conversion(full_csv, partial_csv) + timeframe_ms
+        last_timestamp_str = df_full.iloc[-1]["timestamp"]
+        print(f"\nAggiornamento {symbol} dal {last_timestamp_str} con timeframe {TIMEFRAME}")
+
+    else:
+        since = start_ts_ms
+        print(f"\nNessun file precedente per {symbol}, parto con timeframe {TIMEFRAME} da {START_DATE}")
+
+    buffer: list = []
+    batch_counter = 0
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    retry_count = 0
+    rate_limit_s = (getattr(exchange, "rateLimit", 1000) / 1000.0) * RATE_LIMIT_SAFETY
+
+    while since < now_ms:
+        check_escape()
+        if stop_flag:
+            break
+
+        t0 = time.time()
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME,
+                                         since=since, limit=BATCH_LIMIT)
+            retry_count = 0
+        except Exception as e:
+            if buffer:
+                save_partial(buffer, partial_csv)
+                buffer.clear()
+            retry_count += 1
+            progress_print([
+                f"ERRORE ({retry_count}/{MAX_RETRIES}) su {symbol}: {e}",
+                "Ritentativo tra 5 s…",
+            ])
+            if retry_count >= MAX_RETRIES:
+                print(f"\nInterrotto: impossibile proseguire per errore: {e}")
+                return False
+            time.sleep(5)
+            continue
+
+        if not ohlcv:
+            break
+
+        for ts, _, _, _, close, *_ in ohlcv:
+            buffer.append([ts, close])
+            last_timestamp_str = datetime.fromtimestamp(ts / 1000,
+                                tz=timezone.utc).strftime("%d/%m/%Y %H:%M")
+
+        last_ts = ohlcv[-1][0]
+        since   = last_ts + timeframe_ms
+        batch_counter += 1
+
+        pair_progress    = (last_ts - start_ts_ms) / (now_ms - start_ts_ms)
+        overall_progress = (current_pair_idx - 1 + pair_progress) / total_pairs
+        progress_print([
+            f"Operazione {current_pair_idx}/{total_pairs}:",
+            f"Coppia attuale: {symbol}",
+            f"Recuperate {len(ohlcv)} candele - {last_timestamp_str}",
+            f"Completato: {overall_progress * 100:6.2f} %",
+        ])
+
+        if batch_counter % PARTIAL_EVERY == 0:
+            save_partial(buffer, partial_csv)
+            buffer.clear()
+
+        elapsed = time.time() - t0
+        time.sleep(max(0.0, rate_limit_s - elapsed))
+
+    if stop_flag:
+        if buffer:
+            save_partial(buffer, partial_csv)
+        return False
+
+    if buffer:
+        save_partial(buffer, partial_csv)
+
+    consolidate_csv(full_csv, partial_csv, convert_btc)
+    print()  # riga vuota
+    return True
