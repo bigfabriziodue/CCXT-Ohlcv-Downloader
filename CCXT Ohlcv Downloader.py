@@ -17,8 +17,8 @@ from threading import Thread
 # ────────────────────────────────────────────────────────────────────────────────
 # CONFIGURAZIONE MODIFICABILE
 # ────────────────────────────────────────────────────────────────────────────────
-TIMEFRAME = "5m"                   #Timeframe delle candele. Valori: 1m;5m;15m;30m;1h;4h;1d;
-START_DATE = "2025-01-01 00:00:00" #Data di inizio in formato UTC
+TIMEFRAME = "1m"                   #Timeframe delle candele. Valori: 1m;5m;15m;30m;1h;4h;1d;
+START_DATE = "2021-12-31 23:00:00" #Data di inizio in formato UTC
 
 BINANCE_SYMBOLS: List[str] = [        #Simboli da scaricare usando Binance
     "BTC/EUR",
@@ -412,10 +412,61 @@ def download_symbol(exchange: ccxt.Exchange, symbol: str) -> bool:
     consolidate_csv(full_csv, partial_csv, convert_btc)
     print()  # riga vuota
     return True
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Formattazione di tutti i parziali nella cartella
+# ────────────────────────────────────────────────────────────────────────────────
+def format_all_partials() -> None:
+    ConvertSkipped = False
+    partial_files = glob.glob("*_partial.csv")
+    if not partial_files:
+        print("Nessun file parziale da formattare trovato.")
+        return
+    for partial_csv in partial_files:
+        base = partial_csv[:-12]
+        full_csv = f"{base}.csv"
+        convert_btc = ("BAT" in base) or ("CRO" in base)
+        if convert_btc:
+                BTCData = glob.glob("BTC.csv")
+                if not BTCData:
+                    print(f"Per formattare {base} è necessario un csv di BTC completo!")
+                    ConvertSkipped = True
+                    continue  # salta questo file
+                if (btc_df is None or btc_df.empty) and not load_btc_csv_thread.is_alive():
+                    load_btc_csv_thread.start()
+        consolidate_csv(full_csv, partial_csv, convert_btc)
+    if ConvertSkipped: 
+        print("Formattazione completata per i file parziali(Saltati CRO/BAT, csv BTC mancante.).")
+    else:
+        print("Formattazione completata per tutti i file parziali.")
+        
 # ────────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ────────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Downloader OHLCV da Binance e Cryptocom"
+    )
+    parser.add_argument(
+        "-format", action="store_true",
+        help="Formatta i file parziali in file completi"
+    )
+    parser.add_argument(
+        "-verify", action="store_true",
+        help="Verifica integrità dati dei file CSV completi"
+    )
+    parser.add_argument(
+    "-restore", action="store_true",
+    help="Ripara gap nei file CSV completi riscaricando i dati mancanti"
+    )
+    args = parser.parse_args()
+
+    if args.format:
+        format_all_partials()
+        sys.exit(0)
+    
+    #Senza argomenti parte il downloader.
+    print("Premi Ctrl+E per interrompere l'operazione.\n")
     try:
         for exch, symbols in exchanges.items():
             for sym in symbols:
