@@ -439,6 +439,59 @@ def format_all_partials() -> None:
         print("Formattazione completata per i file parziali(Saltati CRO/BAT, csv BTC mancante.).")
     else:
         print("Formattazione completata per tutti i file parziali.")
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Verifica gap dei dati
+# ────────────────────────────────────────────────────────────────────────────────
+
+def verify_data(csv_file: str) -> bool:
+    global timeframe_ms
+
+    print(f"Verifica dati: {csv_file}")
+    df = pd.read_csv(csv_file, sep=";")
+    if "timestamp" not in df.columns or "close" not in df.columns:
+        print("Il file non contiene colonne 'timestamp' o 'close' valide.")
+        return False
+
+    # Controllo formato timestamp
+    def check_ts_format(ts):
+        try:
+            datetime.strptime(str(ts), "%d/%m/%Y %H:%M")
+            return True
+        except Exception:
+            return False
+
+    if not df["timestamp"].apply(check_ts_format).all():
+        print("Alcuni timestamp non sono nel formato corretto.")
+        return False
+
+    timestamps = pd.to_datetime(df["timestamp"], format="%d/%m/%Y %H:%M")
+    diffs = timestamps.diff().dropna()
+
+    expected = timeframe_ms / 60000  # type: ignore # minuti (es 1, 5, 15...)
+
+    gaps = diffs[diffs != pd.Timedelta(minutes=expected)]
+
+    if not gaps.empty:
+        total_gaps = len(gaps)
+        print(f"Trovati {total_gaps} gap temporali non conformi a {int(expected)}m.")
+        print("Gap trovati:")
+
+        to_print = gaps.index if total_gaps <= 10 else gaps.index[:10]
+
+        for idx in to_print:
+            gap_min = int(gaps[idx].total_seconds() / 60)
+            prev_time = timestamps[idx - 1].strftime("%d/%m/%Y %H:%M")
+            curr_time = timestamps[idx].strftime("%d/%m/%Y %H:%M")
+            print(f"C'è un gap temporale di {gap_min} minuti tra la data {prev_time} e la data {curr_time}")
+
+        if total_gaps > 10:
+            print(f"E altri {total_gaps - 10} gaps")
+
+        return False
+
+    print("Nessun problema trovato nei timestamp.")
+    return True
         
 # ────────────────────────────────────────────────────────────────────────────────
 # MAIN
@@ -463,6 +516,30 @@ if __name__ == "__main__":
 
     if args.format:
         format_all_partials()
+        sys.exit(0)
+    
+    if args.verify:
+                # verifica file CSV completi
+        csv_files = [f for f in glob.glob("*.csv") if "_partial" not in f]
+        if not csv_files:
+            print("Nessun file CSV completo trovato per la verifica.")
+            sys.exit(0)
+
+        valid_bases = {sym.split("/")[0] for syms in exchanges.values() for sym in syms}
+        csv_files = [f for f in csv_files if f[:-4] in valid_bases]
+
+        if not csv_files:
+            print("Nessun file CSV valido da verificare.")
+            sys.exit(0)
+
+        all_ok = True
+        for csv_file in csv_files:
+            if not verify_data(csv_file):
+                all_ok = False
+        if all_ok:
+            print("\nTutti i file CSV sono consistenti.")
+        else:
+            print("\nAlcuni file CSV presentano anomalie. Usa -restore per risolvere le anomalie.")
         sys.exit(0)
     
     #Senza argomenti parte il downloader.
