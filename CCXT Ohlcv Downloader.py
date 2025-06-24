@@ -40,7 +40,7 @@ MAX_RETRIES       = 3     #Numero massimo di tentativi per lo stesso errore
 RATE_LIMIT_SAFETY = 1.10  #Aggiunge il 10 % al rateLimit dell'exchange
 DEBUG = True              #Attiva o no la visualizzazione dei messaggi di DEBUG
 BREAKPOINT = False         #Attiva o no lo stop ai breakpoint
-DEBUGDF = False           #Attiva o no l'output del Dataframe a ogni operazione
+DEBUGDF = True           #Attiva o no l'output del Dataframe a ogni operazione
 LOG = True                #Attiva o no il Debug su File
 SHOWCONSOLE = False
 # ────────────────────────────────────────────────────────────────────────────────
@@ -177,7 +177,8 @@ def save_partial(buffer: list, partial_csv: str) -> None:
     csv_exists = os.path.exists(partial_csv)
     mode = "a" if csv_exists else "w"
     header = not csv_exists
-    debug_print(f"Salvo {len(buffer)} righe in mode {mode} con header {header}.")
+    if DEBUG: debug_print(f"Salvo {len(buffer)} righe in mode {mode} con header {header}.")
+    if DEBUGDF: debug_print (f"{df}")
     df.to_csv(partial_csv, mode=mode, header=header, index=False, sep=";")
     
 # ────────────────────────────────────────────────────────────────────────────────
@@ -189,7 +190,7 @@ def consolidate_csv(full_csv: str, partial_csv: str, convert_btc: bool) -> None:
     frames: list[pd.DataFrame] = []
     if os.path.exists(full_csv):
         os.remove(full_csv)
-        debug_print(f"Rimosso csv completo trovato in precedenza: {full_csv}.")
+        if DEBUG: debug_print(f"Rimosso csv completo trovato in precedenza: {full_csv}.")
 
     if os.path.exists(partial_csv):
         df_partial = pd.read_csv(partial_csv, sep=";")
@@ -492,6 +493,122 @@ def verify_data(csv_file: str) -> bool:
 
     print("Nessun problema trovato nei timestamp.")
     return True
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Funzione di restore.
+# ────────────────────────────────────────────────────────────────────────────────
+def restore_from_gaps(csv_file: str, exchange: ccxt.Exchange) -> None:
+    print(f"Ripristino dati per: {csv_file}")
+    df = pd.read_csv(csv_file, sep=";")
+    
+    # Identifica gap come in verify_data ma salvando le date con gap
+    timestamps = pd.to_datetime(df["timestamp"], format="%d/%m/%Y %H:%M")
+    diffs = timestamps.diff().dropna()
+    expected = timeframe_ms / 60000  # type: ignore # minuti
+    
+    gap_indices = diffs[diffs != pd.Timedelta(minutes=expected)].index
+    if gap_indices.empty:
+        print("Nessun gap da riparare.")
+        return
+    
+    # Date da rimuovere (tutta la giornata della data dei gap)
+    dates_to_remove = set()
+    sorted_indices = sorted(gap_indices)
+    for idx in sorted_indices:
+        dt_prev = timestamps[idx - 1].date()
+        dt_curr = timestamps[idx].date()
+        # Aggiungi tutte le date dall'inizio alla fine del gap
+        start = min(dt_prev, dt_curr)
+        end = max(dt_prev, dt_curr)
+        current = start
+        while current <= end:
+            dates_to_remove.add(current)
+            current += timedelta(days=1)
+    
+    print(f"Date con gap da riparare: {', '.join(str(d) for d in sorted(dates_to_remove))}")
+    
+    # Converte csv completo in parziale
+    partial_csv = csv_file.replace(".csv", "_partial.csv")
+    full_to_partial_conversion(csv_file, partial_csv)
+    
+    # Carica parziale
+    df_partial = pd.read_csv(partial_csv, sep=";")
+    
+    # Rimuovi righe del parziale per le date da riparare
+    df_partial["date"] = pd.to_datetime(df_partial["timestamp"], unit='ms', utc=True).dt.date
+    df_partial = df_partial[~df_partial["date"].isin(dates_to_remove)]
+    df_partial.drop(columns=["date"], inplace=True)
+    
+    # Debug stato rimozione date
+    if DEBUG: debug_print("Rimozione date con gap dal parziale", partial_csv, dates=sorted(dates_to_remove), rows_count=len(df_partial))
+    
+    # Riscrivi parziale pulito
+    df_partial.to_csv(partial_csv, index=False, sep=";")
+    
+    # Per ogni data da riparare, scarica dati da exchange e aggiungi a parziale
+    total_dates = len(dates_to_remove)
+    for i, dt in enumerate(sorted(dates_to_remove), 1):
+        start_dt = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
+        since = int(start_dt.timestamp() * 1000)
+        until = since + 86400 * 1000  # +1 giorno in ms
+        
+        progress_print([
+            f"Ripristino {csv_file} ({i}/{total_dates}):",
+            f"Scarico dati per {dt}...",
+        ])
+        
+        all_ohlcv = []
+        fetch_since = since
+        while fetch_since < until:
+            try:
+                symbol = f"{csv_file[:-4]}/{'BTC' if csv_file[:-4] in ['CRO', 'BAT'] else 'EUR'}"
+                ohlcv = exchange.fetch_ohlcv(
+                    symbol=symbol,
+                    timeframe=TIMEFRAME,
+                    since=fetch_since,
+                    limit=BATCH_LIMIT,
+                )
+            except Exception as e:
+                print(f"Errore fetch: {e}")
+                break
+            if not ohlcv:
+                break
+            all_ohlcv.extend(ohlcv)
+            last_ts = ohlcv[-1][0]
+            fetch_since = last_ts + timeframe_ms
+            if last_ts >= until:
+                break
+        
+        # Buffer dati da aggiungere
+        buffer = []
+        for ts, _, _, _, close, *_ in all_ohlcv:
+            if since <= ts < until:
+                buffer.append([ts, close])
+        
+        if buffer:
+            save_partial(buffer, partial_csv)
+            if DEBUG: debug_print(f"Download completato per data {dt}, {partial_csv}")
+            if DEBUGDF: debug_print(f"{buffer}")
+    
+    # Riconverti in csv completo
+    convert_btc = "/BTC" in symbol # type: ignore
+    RestoreSkipped = False
+    if convert_btc:
+        BTCData = glob.glob("BTC.csv")
+        if not BTCData:
+            print(f"Per ripristinare {base} è necessario un csv di BTC completo!")
+            RestoreSkipped = True
+        else:
+            if (btc_df is None or btc_df.empty) and not load_btc_csv_thread.is_alive():
+                load_btc_csv_thread.start()
+            consolidate_csv(csv_file, partial_csv, convert_btc)
+    else: consolidate_csv(csv_file, partial_csv, convert_btc)
+    if DEBUG: (f"Consolidamento completato {csv_file}")
+    if RestoreSkipped:
+        print(f"Ripristino fallito per {csv_file}(BTC.csv completo mancante!)\n")
+    else:
+        print(f"Ripristino completato per {csv_file}")
+
         
 # ────────────────────────────────────────────────────────────────────────────────
 # MAIN
@@ -540,6 +657,32 @@ if __name__ == "__main__":
             print("\nTutti i file CSV sono consistenti.")
         else:
             print("\nAlcuni file CSV presentano anomalie. Usa -restore per risolvere le anomalie.")
+        sys.exit(0)
+        
+    if args.restore:
+        csv_files = [f for f in glob.glob("*.csv") if "_partial" not in f]
+        valid_bases = {sym.split("/")[0] for syms in exchanges.values() for sym in syms}
+        csv_files = [f for f in csv_files if f[:-4] in valid_bases]
+
+        if not csv_files:
+            print("Nessun file CSV valido da riparare.")
+            sys.exit(0)
+
+        base_to_exchange = {}
+        for exch, syms in exchanges.items():
+            for sym in syms:
+                base = sym.split("/")[0]
+                base_to_exchange[base] = exch
+
+        for csv_file in csv_files:
+            base = csv_file[:-4]
+            exch = base_to_exchange.get(base)
+            if not exch:
+                print(f"Exchange non trovato per {csv_file}, skip.")
+                continue
+            restore_from_gaps(csv_file, exch)
+
+        print("Ripristino completato per tutti i file.")
         sys.exit(0)
     
     #Senza argomenti parte il downloader.
