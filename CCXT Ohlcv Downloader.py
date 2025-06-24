@@ -485,9 +485,16 @@ def verify_data(csv_file: str) -> bool:
             prev_time = timestamps[idx - 1].strftime("%d/%m/%Y %H:%M")
             curr_time = timestamps[idx].strftime("%d/%m/%Y %H:%M")
             print(f"C'è un gap temporale di {gap_min} minuti tra la data {prev_time} e la data {curr_time}")
+            if DEBUG: debug_print(f"C'è un gap temporale di {gap_min} minuti tra la data {prev_time} e la data {curr_time}")
 
         if total_gaps > 10:
             print(f"E altri {total_gaps - 10} gaps")
+            if DEBUG:
+                for idx in gaps.index:
+                    gap_min = int(gaps[idx].total_seconds() / 60)
+                    prev_time = timestamps[idx - 1].strftime("%d/%m/%Y %H:%M")
+                    curr_time = timestamps[idx].strftime("%d/%m/%Y %H:%M")
+                    debug_print(f"C'è un gap temporale di {gap_min} minuti tra la data {prev_time} e la data {curr_time}")
 
         return False
 
