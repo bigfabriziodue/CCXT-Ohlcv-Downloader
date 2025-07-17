@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import List
 from datetime import timedelta
 from threading import Thread
+from typing import Optional
 
 # ────────────────────────────────────────────────────────────────────────────────
 # CONFIGURAZIONE MODIFICABILE
@@ -22,16 +23,11 @@ START_DATE = "2021-12-31 23:00:00" #Data di inizio in formato UTC
 
 BINANCE_SYMBOLS: List[str] = [        #Simboli da scaricare usando Binance
     "BTC/EUR",
-    "ETH/EUR",
-    "XRP/EUR",
-    "SOL/EUR",
-    "BNB/EUR",
-    "DOGE/EUR",
     "BAT/BTC",
 ]
 
 CRYPTOCOM_SYMBOLS: List[str] = [         #Simboli da scaricare usando Crypto.com
-    "CRO/BTC",
+
 ]
 
 BATCH_LIMIT       = 1000  #Dimensione massima per fetch_ohlcv
@@ -102,6 +98,7 @@ total_pairs = sum(len(syms) for syms in exchanges.values())
 current_pair_idx = 0
 stop_flag = False
 printed_lines = 0
+skipanswer = False
 last_symbol: str | None = None
 last_timestamp_str: str | None = None
 btc_df= None
@@ -184,6 +181,25 @@ def save_partial(buffer: list, partial_csv: str) -> None:
 # ────────────────────────────────────────────────────────────────────────────────
 # Consolidamento: parziale → completo
 # ────────────────────────────────────────────────────────────────────────────────
+def get_btc_price(timestamp: str) -> Optional[float]:
+    with btc_df_lock:
+        if btc_df is None or btc_df.empty:
+            debug_print ("Dataframe BTC/EUR non caricato correttamente!", level="e")
+            print ("Dataframe BTC/EUR non caricato correttamente. Uscita...")
+            sys.exit(1)
+    #row = btc_df[btc_df["timestamp"] == timestamp]
+    if (BREAKPOINT): input("Breakpoint")
+    price_str = btc_price_dict.get(timestamp)
+    debug_print(f"Timestamp in get_btc_price: {timestamp}")
+    if price_str is not None:
+    #if not row.empty:
+        #btc_price = row.iloc[0]["close"]
+        #return float(str(btc_price).replace(",", "."))
+        return float(str(price_str).replace(",", "."))
+    else:
+        debug_print(f"Timestamp BTC non trovato: {timestamp}", level="w")
+        return None
+
 def consolidate_csv(full_csv: str, partial_csv: str, convert_btc: bool) -> None:
     print(f"Consolidamento in corso: {partial_csv} → {full_csv}...")
 
@@ -226,24 +242,7 @@ def consolidate_csv(full_csv: str, partial_csv: str, convert_btc: bool) -> None:
     df_all["timestamp"] = df_all["timestamp"].dt.strftime("%d/%m/%Y %H:%M")
     debug_print("Formattato correttamente tutti i timestamp.")
     if (BREAKPOINT): input("Breakpoint")
-    
-    def get_btc_price(timestamp: str) -> float:
-        with btc_df_lock:
-            if btc_df is None or btc_df.empty:
-                debug_print ("Dataframe BTC/EUR non caricato correttamente!", level="e")
-                return 1.0
-        #row = btc_df[btc_df["timestamp"] == timestamp]
-        if (BREAKPOINT): input("Breakpoint")
-        price_str = btc_price_dict.get(timestamp)
-        if price_str is not None:
-        #if not row.empty:
-            #btc_price = row.iloc[0]["close"]
-            #return float(str(btc_price).replace(",", "."))
-            return float(str(price_str).replace(",", "."))
-        else:
-            debug_print(f"Timestamp BTC non trovato: {timestamp}", level="w")
-            return 1.0
-        
+          
 
     def format_close(val, timestamp):
         try:
@@ -253,13 +252,15 @@ def consolidate_csv(full_csv: str, partial_csv: str, convert_btc: bool) -> None:
                     debug_print("Attendo Thread...") 
                     load_btc_csv_thread.join()
                 btc_price = get_btc_price(timestamp)
+                if btc_price is None: return None
                 price *= btc_price
             return f"{price:.2f}".replace(".", ",")
         except Exception as e:
             debug_print(f"Non sono riuscito a formattare {val} in {timestamp}:\n" + str(e), level="w")
-            return val
+            return None
 
-    df_all["close"] = df_all.apply(lambda row: format_close(row["close"], row["timestamp"]), axis=1)
+    df_all["close"] = df_all.apply(lambda row: format_close(row["close"], row["timestamp"]), axis=1) # type: ignore
+    df_all.dropna(subset=['close'], inplace=True)
     if (DEBUGDF): debug_print("Dopo format_close",df_all.head(3))
     debug_print("Formattato e convertiti correttamente tutti i prezzi.")
 
@@ -275,26 +276,62 @@ def consolidate_csv(full_csv: str, partial_csv: str, convert_btc: bool) -> None:
 def full_to_partial_conversion(full_csv: str, partial_csv: str) -> int:
     try:
         print(f"Conversione {full_csv} → {partial_csv} (ripartenza)...")
+        if (DEBUG): debug_print(f"{full_csv} csv caricato su check convert_btc")
+        convert_btc = ("BAT" in full_csv) or ("CRO" in full_csv)
+        if convert_btc:
+            BTCData = glob.glob("BTC.csv")
+            debug_print("Convert_BTC è TRUE!")
+            if not BTCData:
+                raise FileNotFoundError(f"Per riprende {base} è necessario un csv di BTC completo!")
+            if (btc_df is None or btc_df.empty) and not load_btc_csv_thread.is_alive():
+                load_btc_csv_thread.start()
         df_full = pd.read_csv(full_csv, sep=";")
-        
         df_full["timestamp"] = pd.to_datetime(
             df_full["timestamp"],
             format="%d/%m/%Y %H:%M",
             utc=True,
             errors="coerce"       #Stringhe non valide → NaT
         )
+        if (DEBUGDF): debug_print("Dopo conversione df_full",df_full.head(3))
         df_full.dropna(subset=["timestamp"], inplace=True)
-        df_full["timestamp"] = (df_full["timestamp"].astype(int) // 10**6)
-        
-        df_full["close"] = df_full["close"].str.replace(",", ".").astype(float)
-        df_full.to_csv(partial_csv, index=False, sep=";")
+        if convert_btc:
+            if load_btc_csv_thread.is_alive():
+                debug_print("Attendo Thread BTC per riconversione EUR→BTC...")
+                load_btc_csv_thread.join()
+            def reverse_btc_conversion(row):
+                timestamp = row["timestamp"]
+                timestamp = timestamp.strftime('%d/%m/%Y %H:%M')
+                try:
+                    btc_price = get_btc_price(timestamp)
+                    price = row["close"]
+                    price = float(price.replace(",", "."))
+                    if btc_price is None: 
+                        debug_print(f"Prezzo BTC non trovato per timestamp {timestamp} completo.", level="e")
+                        sys.exit(1)
+                    else:
+                        price /= btc_price
+                        return price
+                except Exception as e:
+                    debug_print(f"Errore durante la riconversione EUR→BTC: {e}", level="w")
+                    sys.exit(1)
+                    
+            df_full["close"] = df_full.apply(reverse_btc_conversion, axis=1)
+            df_full["timestamp"] = (df_full["timestamp"].astype(int) // 10**6)
+            df_full.dropna(subset=["timestamp"], inplace=True)
+            df_full.to_csv(partial_csv, index=False, sep=";")
+        else:    
+            df_full["close"] = df_full["close"].str.replace(",", ".").astype(float)
+            df_full["timestamp"] = (df_full["timestamp"].astype(int) // 10**6)
+            df_full.dropna(subset=["timestamp"], inplace=True)
+            df_full.to_csv(partial_csv, index=False, sep=";")
         
         if df_full.empty:
              raise ValueError(f"{partial_csv} non risulta essere riconvertito correttamente!")
         return int(df_full.iloc[-1]["timestamp"])
     except Exception as e:
         debug_print(e, level="e")
-        return 0
+        print(f"{partial_csv} non risulta essere riconvertito correttamente!")
+        sys.exit(1)
 # ────────────────────────────────────────────────────────────────────────────────
 # Download singolo simbolo
 # ────────────────────────────────────────────────────────────────────────────────
@@ -330,10 +367,11 @@ def download_symbol(exchange: ccxt.Exchange, symbol: str) -> bool:
         print(f"\nRiprendo {symbol} con timeframe {TIMEFRAME} da timestamp {last_timestamp_str} (parziale)")
 
     elif not df_full.empty:
-        answer = input(f"Trovato file completo per {symbol}. Vuoi aggiornarlo? (s/n): ").strip().lower()
-        if answer != "s":
-            print(f"Salto aggiornamento {symbol}.")
-            return True
+        if not skipanswer: 
+            answer = input(f"Trovato file completo per {symbol}. Vuoi aggiornarlo? (s/n): ").strip().lower()
+            if answer != "s":
+                print(f"Salto aggiornamento {symbol}.")
+                return True
 
         since = full_to_partial_conversion(full_csv, partial_csv) + timeframe_ms
         last_timestamp_str = df_full.iloc[-1]["timestamp"]
@@ -633,8 +671,12 @@ if __name__ == "__main__":
         help="Verifica integrità dati dei file CSV completi"
     )
     parser.add_argument(
-    "-restore", action="store_true",
-    help="Ripara gap nei file CSV completi riscaricando i dati mancanti"
+        "-restore", action="store_true",
+        help="Ripara gap nei file CSV completi riscaricando i dati mancanti"
+    )
+    parser.add_argument(
+        "-auto", action="store_true",
+        help="Modalità download automatica(Skip input utente)"
     )
     args = parser.parse_args()
 
@@ -692,16 +734,32 @@ if __name__ == "__main__":
         print("Ripristino completato per tutti i file.")
         sys.exit(0)
     
+    if args.auto:
+        print("Premi Ctrl+E per interrompere l'operazione.\n")
+        skipanswer = True
+        try:
+            for exch, symbols in exchanges.items():
+                for sym in symbols:
+                    result = download_symbol(exch, sym)
+                    if not result:
+                        print("\nDownload interrotto dall'utente.")
+                        sys.exit(0)
+            print("\nDownload completato!")
+        except KeyboardInterrupt:
+            print("\nEsecuzione interrotta dall'utente.")
+            sys.exit(0)
+    
     #Senza argomenti parte il downloader.
-    print("Premi Ctrl+E per interrompere l'operazione.\n")
-    try:
-        for exch, symbols in exchanges.items():
-            for sym in symbols:
-                result = download_symbol(exch, sym)
-                if not result:
-                    print("\nDownload interrotto dall'utente.")
-                    sys.exit(0)
-        print("\nDownload completato!")
-    except KeyboardInterrupt:
-        print("\nEsecuzione interrotta dall'utente.")
-        sys.exit(0)
+    if not (args.auto) and not (args.restore) and not (args.verify) and not (args.format):
+        print("Premi Ctrl+E per interrompere l'operazione.\n")
+        try:
+            for exch, symbols in exchanges.items():
+                for sym in symbols:
+                    result = download_symbol(exch, sym)
+                    if not result:
+                        print("\nDownload interrotto dall'utente.")
+                        sys.exit(0)
+            print("\nDownload completato!")
+        except KeyboardInterrupt:
+            print("\nEsecuzione interrotta dall'utente.")
+            sys.exit(0)
