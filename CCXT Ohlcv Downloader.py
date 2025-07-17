@@ -198,7 +198,6 @@ def get_btc_price(timestamp: str) -> Optional[float]:
     #row = btc_df[btc_df["timestamp"] == timestamp]
     if (BREAKPOINT): input("Breakpoint")
     price_str = btc_price_dict.get(timestamp)
-    debug_print(f"Timestamp in get_btc_price: {timestamp}")
     if price_str is not None:
     #if not row.empty:
         #btc_price = row.iloc[0]["close"]
