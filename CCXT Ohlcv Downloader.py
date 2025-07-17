@@ -155,7 +155,10 @@ load_btc_csv_thread = Thread(target = load_btc_csv)
 # ────────────────────────────────────────────────────────────────────────────────
 def load_csv_safe(filename: str) -> pd.DataFrame:
     if not os.path.exists(filename):
-        debug_print("Non ho trovato un csv completo.")
+        if "_partial" in filename: 
+            debug_print("Non ho trovato un csv parziale.")
+        else:
+            debug_print("Non ho trovato un csv completo.")
         return pd.DataFrame()
     try:
         debug_print("Ho trovato un csv completo.")
