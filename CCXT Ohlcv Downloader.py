@@ -23,11 +23,16 @@ START_DATE = "2021-12-31 23:00:00" #Data di inizio in formato UTC
 
 BINANCE_SYMBOLS: List[str] = [        #Simboli da scaricare usando Binance
     "BTC/EUR",
+    "ETH/EUR",
+    "XRP/EUR",
+    "SOL/EUR",
+    "BNB/EUR",
+    "DOGE/EUR",
     "BAT/BTC",
 ]
 
 CRYPTOCOM_SYMBOLS: List[str] = [         #Simboli da scaricare usando Crypto.com
-
+    "CRO/BTC",
 ]
 
 BATCH_LIMIT       = 1000  #Dimensione massima per fetch_ohlcv
