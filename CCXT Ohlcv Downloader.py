@@ -14,25 +14,21 @@ from typing import List
 from datetime import timedelta
 from threading import Thread
 from typing import Optional
+from pathlib import Path
 
 # ────────────────────────────────────────────────────────────────────────────────
 # CONFIGURAZIONE MODIFICABILE
 # ────────────────────────────────────────────────────────────────────────────────
-TIMEFRAME = "5m"                   #Timeframe delle candele. Valori: 1m;5m;15m;30m;1h;4h;1d;
+TIMEFRAME = "1m"                   #Timeframe delle candele. Valori: 1m;5m;15m;30m;1h;4h;1d;
 START_DATE = "2021-12-31 23:00:00" #Data di inizio in formato UTC
 
 BINANCE_SYMBOLS: List[str] = [        #Simboli da scaricare usando Binance
     "BTC/EUR",
-    "ETH/EUR",
-    "XRP/EUR",
-    "SOL/EUR",
-    "BNB/EUR",
-    "DOGE/EUR",
-    "BAT/BTC",
+    "BAT/BTC"
 ]
 
 CRYPTOCOM_SYMBOLS: List[str] = [         #Simboli da scaricare usando Crypto.com
-    "CRO/BTC",
+
 ]
 
 BATCH_LIMIT       = 1000  #Dimensione massima per fetch_ohlcv
@@ -41,7 +37,7 @@ MAX_RETRIES       = 3     #Numero massimo di tentativi per lo stesso errore
 RATE_LIMIT_SAFETY = 1.10  #Aggiunge il 10 % al rateLimit dell'exchange
 DEBUG = True              #Attiva o no la visualizzazione dei messaggi di DEBUG
 BREAKPOINT = False         #Attiva o no lo stop ai breakpoint
-DEBUGDF = True           #Attiva o no l'output del Dataframe a ogni operazione
+DEBUGDF = False           #Attiva o no l'output del Dataframe a ogni operazione
 LOG = True                #Attiva o no il Debug su File
 SHOWCONSOLE = False
 # ────────────────────────────────────────────────────────────────────────────────
@@ -49,21 +45,27 @@ SHOWCONSOLE = False
 # ────────────────────────────────────────────────────────────────────────────────
 # FUNZIONE DI PRINT DEBUG
 # ────────────────────────────────────────────────────────────────────────────────
-def debug_print(*args, level="d", **kwargs):
+def dprint(*args, level="i", **kwargs):
+    prefixes = {
+        "i": "[INFO]:",
+        "w": "[WARNING]:",
+        "e": "[ERROR]:",
+    }
+    prefix = prefixes.get(level.lower(), "[INFO]:")
+    msg = " ".join(str(a) for a in args)
+
     if DEBUG:
-        prefixes = {
-            "d": "[DEBUG]:",
-            "w": "[WARNING]:",
-            "e": "[ERROR]:",
-        }
-        prefix = prefixes.get(level.lower(), "[DEBUG]:")
-        if (SHOWCONSOLE): print(prefix, *args, **kwargs)
-        msg = " ".join(str(a) for a in args)
+        if SHOWCONSOLE:
+            print(prefix, *args, **kwargs)
         if LOG:
             with open("log.txt", "a", encoding="utf-8") as f:
                 f.write(f"{prefix} {msg}\n")
-                f.flush()                  # forza flush
-                os.fsync(f.fileno())       # forza scrittura su disco
+                f.flush()
+                os.fsync(f.fileno())
+
+    if level.lower() == "e":
+        print(msg)
+        sys.exit(1)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # ABILITA SEQUENZE ANSI SU WINDOWS (per riscrivere più righe senza scroll)
@@ -126,28 +128,25 @@ def progress_print(lines: List[str]) -> None:
     sys.stdout.flush()
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Controllo Ctrl+E (Windows) per interrompere
-# ────────────────────────────────────────────────────────────────────────────────
-def check_escape() -> None:
-    global stop_flag
-    while msvcrt.kbhit():
-        if msvcrt.getch() == b"\x05":  # Ctrl+E
-            stop_flag = True
-# ────────────────────────────────────────────────────────────────────────────────
 # Funzione di caricamento CSV BTC in Dataframe
 # ────────────────────────────────────────────────────────────────────────────────
 def load_btc_csv():
-    debug_print("Thread Load CSV BTC avviato!")
+    dprint("Thread Load CSV BTC avviato!")
     try:
         global btc_df, btc_price_dict
         path = os.path.join(os.path.dirname(__file__), "BTC.csv")
         df = pd.read_csv(path, sep=";", dtype={"timestamp": str})
         with btc_df_lock:
+            if df is None or df.empty:
+                raise ValueError("Dataframe BTC/EUR vuoto.")
             btc_df = df
-            btc_price_dict = btc_df.set_index("timestamp")["close"].to_dict()
-        debug_print("CSV BTC caricato")
+            btc_price_dict = {
+                timestamp: float(str(price).replace(",", ".")) 
+                for timestamp, price in btc_df.set_index("timestamp")["close"].to_dict().items()
+            }
+        dprint("CSV BTC caricato")
     except Exception as e:
-        debug_print("Non sono riuscito a caricare il CSV di BTC:\n" + str(e), level="w")
+        dprint("Non sono riuscito a caricare il CSV di BTC:\n" + str(e), level="e")
 
 load_btc_csv_thread = Thread(target = load_btc_csv)
 # ────────────────────────────────────────────────────────────────────────────────
@@ -156,12 +155,12 @@ load_btc_csv_thread = Thread(target = load_btc_csv)
 def load_csv_safe(filename: str) -> pd.DataFrame:
     if not os.path.exists(filename):
         if "_partial" in filename: 
-            debug_print("Non ho trovato un csv parziale.")
+            dprint("Non ho trovato un csv parziale.")
         else:
-            debug_print("Non ho trovato un csv completo.")
+            dprint("Non ho trovato un csv completo.")
         return pd.DataFrame()
     try:
-        debug_print("Ho trovato un csv completo.")
+        dprint(f"Sto caricando {filename}")
         df = pd.read_csv(filename, sep=";")
         df.columns = [c.lower() for c in df.columns]
         if "timestamp" in df.columns and not df.empty:
@@ -171,111 +170,86 @@ def load_csv_safe(filename: str) -> pd.DataFrame:
         else:
             raise ValueError("CSV non formattato corretamente.")
     except Exception as e:
-        debug_print("Non sono riuscito a decodificare il csv completo:\n" + str(e), level="w")
+        dprint("Non sono riuscito a decodificare il csv completo:\n" + str(e), level="w")
         return pd.DataFrame()
 
 def save_partial(buffer: list, partial_csv: str) -> None:
-    if not buffer:
-        debug_print("Il buffer è vuoto, non c'è nulla da salvare.", level="w")
-        return
-    df = pd.DataFrame(buffer, columns=["timestamp", "close"])
-    csv_exists = os.path.exists(partial_csv)
-    mode = "a" if csv_exists else "w"
-    header = not csv_exists
-    if DEBUG: debug_print(f"Salvo {len(buffer)} righe in mode {mode} con header {header}.")
-    if DEBUGDF: debug_print (f"{df}")
-    df.to_csv(partial_csv, mode=mode, header=header, index=False, sep=";")
+    try:
+        if not buffer:
+            dprint("Il buffer è vuoto, non c'è nulla da salvare.", level="w")
+            return
+        df = pd.DataFrame(buffer, columns=["timestamp", "close"])
+        csv_exists = os.path.exists(partial_csv)
+        mode = "a" if csv_exists else "w"
+        header = not csv_exists
+        dprint(f"Salvo {len(buffer)} righe in mode {mode} con header {header}.")
+        if DEBUGDF: dprint (f"{df}")
+        df.to_csv(partial_csv, mode=mode, header=header, index=False, sep=";")
+    except Exception as e:
+        dprint (e, level="e")
     
 # ────────────────────────────────────────────────────────────────────────────────
 # Consolidamento: parziale → completo
 # ────────────────────────────────────────────────────────────────────────────────
-def get_btc_price(timestamp: str) -> Optional[float]:
-    with btc_df_lock:
-        if btc_df is None or btc_df.empty:
-            debug_print ("Dataframe BTC/EUR non caricato correttamente!", level="e")
-            print ("Dataframe BTC/EUR non caricato correttamente. Uscita...")
-            sys.exit(1)
-    #row = btc_df[btc_df["timestamp"] == timestamp]
-    if (BREAKPOINT): input("Breakpoint")
-    price_str = btc_price_dict.get(timestamp)
-    if price_str is not None:
-    #if not row.empty:
-        #btc_price = row.iloc[0]["close"]
-        #return float(str(btc_price).replace(",", "."))
-        return float(str(price_str).replace(",", "."))
-    else:
-        debug_print(f"Timestamp BTC non trovato: {timestamp}", level="w")
-        return None
-
 def consolidate_csv(full_csv: str, partial_csv: str, convert_btc: bool) -> None:
-    print(f"Consolidamento in corso: {partial_csv} → {full_csv}...")
+    try:
+        print(f"Consolidamento in corso: {partial_csv} → {full_csv}...")
 
-    frames: list[pd.DataFrame] = []
-    if os.path.exists(full_csv):
-        os.remove(full_csv)
-        if DEBUG: debug_print(f"Rimosso csv completo trovato in precedenza: {full_csv}.")
+        frames: list[pd.DataFrame] = []
 
-    if os.path.exists(partial_csv):
-        df_partial = pd.read_csv(partial_csv, sep=";")
-        df_partial.columns = [c.lower() for c in df_partial.columns]
-        frames.append(df_partial)
-        debug_print(f"Aggiornato csv parziale: {partial_csv}.")
+        if os.path.exists(partial_csv):
+            df_partial = pd.read_csv(partial_csv, sep=";")
+            df_partial.columns = [c.lower() for c in df_partial.columns]
+            frames.append(df_partial)
+            dprint(f"Aggiornato csv parziale: {partial_csv}.")
 
-    if not frames:
-        debug_print("Il buffer è vuoto. Niente da consolidare.", level="e")
-        return
+        if not frames:
+            dprint("Il buffer è vuoto. Niente da consolidare.", level="w")
+            return
 
-    df_all = pd.concat(frames, ignore_index=True).drop_duplicates(subset="timestamp")
+        df_all = pd.concat(frames, ignore_index=True).drop_duplicates(subset="timestamp")
 
-#    def parse_timestamp(ts) -> Union[datetime, NaTType]:
-#        try:
-#            if isinstance(ts, (int, float)):
-#                return datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
-#            return datetime.strptime(str(ts), "%d/%m/%Y %H:%M")
-#        except Exception as e:
-#            debug_print(f"Timestamp non valido durante il parsing: {ts} - {e}", level="w")
-#            return pd.NaT
+        if (DEBUGDF): dprint(df_all.head(3))
+        df_all["timestamp"] = pd.to_datetime(df_all["timestamp"], unit="ms", utc=True)
+        
+        if (DEBUGDF): dprint("Dopo timestamp to datetime",df_all.head(3))
+        
+        df_all.dropna(subset=["timestamp"], inplace=True)
+        df_all.sort_values("timestamp", inplace=True)
+        df_all["timestamp"] = df_all["timestamp"].dt.strftime("%d/%m/%Y %H:%M")
+        dprint("Formattato correttamente tutti i timestamp.")
+        if (BREAKPOINT): input("Breakpoint")
 
-#     df_all["timestamp"] = df_all["timestamp"].apply(parse_timestamp)
+        if convert_btc:
+            if load_btc_csv_thread.is_alive():
+                dprint("Attendo caricamento CSV BTC...")
+                load_btc_csv_thread.join()
+                
+            df_all["btc_price"] = df_all["timestamp"].map(btc_price_dict)
+            missing_ts = df_all.loc[df_all["btc_price"].isna(), "timestamp"].unique()
+            dprint(f"Timestamp BTC non trovati: {missing_ts.tolist()}", level="w")
+            df_all.dropna(subset="btc_price", inplace=True)
+            
+            df_all["close"] = df_all["close"].astype(float) * df_all["btc_price"].astype(float)
+            df_all.dropna(subset=["btc_price"], inplace=True)
+        else:
+            df_all["close"] = df_all["close"].astype(float)
 
-    if (DEBUGDF): debug_print(df_all.head(3))
-    
-    df_all["timestamp"] = pd.to_datetime(df_all["timestamp"], unit="ms", utc=True)
-    
-    if (DEBUGDF): debug_print("Dopo timestamp to datetime",df_all.head(3))
-    
-    df_all.dropna(subset=["timestamp"], inplace=True)
-    df_all.sort_values("timestamp", inplace=True)
-    df_all["timestamp"] = df_all["timestamp"].dt.strftime("%d/%m/%Y %H:%M")
-    debug_print("Formattato correttamente tutti i timestamp.")
-    if (BREAKPOINT): input("Breakpoint")
-          
+        df_all["close"] = df_all["close"].apply(lambda x: f"{x:.2f}".replace(".", ","))
+        df_all.dropna(subset=['close'], inplace=True)
+        
+        if (DEBUGDF): dprint("Dopo format_close",df_all.head(3))
+        dprint("Formattato e convertiti correttamente tutti i prezzi.")
+        
+        if os.path.exists(full_csv):
+            os.remove(full_csv)
+            dprint(f"Rimosso csv completo trovato in precedenza: {full_csv}.")
+        df_all.to_csv(full_csv, index=False, sep=";")
 
-    def format_close(val, timestamp):
-        try:
-            price = float(val)
-            if convert_btc and load_btc_csv_thread:
-                if load_btc_csv_thread.is_alive():
-                    debug_print("Attendo Thread...") 
-                    load_btc_csv_thread.join()
-                btc_price = get_btc_price(timestamp)
-                if btc_price is None: return None
-                price *= btc_price
-            return f"{price:.2f}".replace(".", ",")
-        except Exception as e:
-            debug_print(f"Non sono riuscito a formattare {val} in {timestamp}:\n" + str(e), level="w")
-            return None
-
-    df_all["close"] = df_all.apply(lambda row: format_close(row["close"], row["timestamp"]), axis=1) # type: ignore
-    df_all.dropna(subset=['close'], inplace=True)
-    if (DEBUGDF): debug_print("Dopo format_close",df_all.head(3))
-    debug_print("Formattato e convertiti correttamente tutti i prezzi.")
-
-    df_all.to_csv(full_csv, index=False, sep=";")
-
-    if os.path.exists(partial_csv):
-        os.remove(partial_csv)
-
+        if os.path.exists(partial_csv):
+            os.remove(partial_csv)
+    except Exception as e:
+        dprint(e, level="e")
 # ────────────────────────────────────────────────────────────────────────────────
 # Conversione: completo → parziale
 # ────────────────────────────────────────────────────────────────────────────────
@@ -283,11 +257,9 @@ def consolidate_csv(full_csv: str, partial_csv: str, convert_btc: bool) -> None:
 def full_to_partial_conversion(full_csv: str, partial_csv: str) -> int:
     try:
         print(f"Conversione {full_csv} → {partial_csv} (ripartenza)...")
-        if (DEBUG): debug_print(f"{full_csv} csv caricato su check convert_btc")
         convert_btc = ("BAT" in full_csv) or ("CRO" in full_csv)
         if convert_btc:
             BTCData = glob.glob("BTC.csv")
-            debug_print("Convert_BTC è TRUE!")
             if not BTCData:
                 raise FileNotFoundError(f"Per riprende {full_csv} è necessario un csv di BTC completo!")
             if (btc_df is None or btc_df.empty) and not load_btc_csv_thread.is_alive():
@@ -299,32 +271,18 @@ def full_to_partial_conversion(full_csv: str, partial_csv: str) -> int:
             utc=True,
             errors="coerce"       #Stringhe non valide → NaT
         )
-        if (DEBUGDF): debug_print("Dopo conversione df_full",df_full.head(3))
+        if (DEBUGDF): dprint("Dopo conversione df_full",df_full.head(3))
         df_full.dropna(subset=["timestamp"], inplace=True)
         if convert_btc:
             if load_btc_csv_thread.is_alive():
-                debug_print("Attendo Thread BTC per riconversione EUR→BTC...")
+                dprint("Attendo Thread BTC per riconversione EUR→BTC...")
                 load_btc_csv_thread.join()
-            def reverse_btc_conversion(row):
-                timestamp = row["timestamp"]
-                timestamp = timestamp.strftime('%d/%m/%Y %H:%M')
-                try:
-                    btc_price = get_btc_price(timestamp)
-                    price = row["close"]
-                    price = float(price.replace(",", "."))
-                    if btc_price is None: 
-                        debug_print(f"Prezzo BTC non trovato per timestamp {timestamp} completo.", level="e")
-                        print(f"Prezzo BTC non trovato per timestamp {timestamp} completo.")
-                        sys.exit(1)
-                    else:
-                        price /= btc_price
-                        return price
-                except Exception as e:
-                    debug_print(f"Errore durante la riconversione EUR→BTC: {e}", level="e")
-                    print(f"Errore durante la riconversione EUR→BTC: {e}")
-                    sys.exit(1)
-                    
-            df_full["close"] = df_full.apply(reverse_btc_conversion, axis=1)
+            df_full["ts_str"] = df_full["timestamp"].dt.strftime('%d/%m/%Y %H:%M')
+            df_full["btc_price"] = df_full["ts_str"].map(btc_price_dict)
+            df_full["close"] = df_full["close"].str.replace(",", ".").astype(float)
+            df_full["close"] = df_full["close"] / df_full["btc_price"].astype(float)
+            df_full.dropna(subset=["close", "btc_price"], inplace=True)
+            
             df_full["timestamp"] = (df_full["timestamp"].astype(int) // 10**6)
             df_full.dropna(subset=["timestamp"], inplace=True)
             df_full.to_csv(partial_csv, index=False, sep=";")
@@ -335,12 +293,11 @@ def full_to_partial_conversion(full_csv: str, partial_csv: str) -> int:
             df_full.to_csv(partial_csv, index=False, sep=";")
         
         if df_full.empty:
-             raise ValueError(f"{partial_csv} non risulta essere riconvertito correttamente!")
+            raise ValueError(f"{partial_csv} non risulta essere riconvertito correttamente!")
         return int(df_full.iloc[-1]["timestamp"])
+    
     except Exception as e:
-        debug_print(e, level="e")
-        print(e)
-        sys.exit(1)
+        dprint(e, level="e")
 # ────────────────────────────────────────────────────────────────────────────────
 # Download singolo simbolo
 # ────────────────────────────────────────────────────────────────────────────────
@@ -397,10 +354,6 @@ def download_symbol(exchange: ccxt.Exchange, symbol: str) -> bool:
     rate_limit_s = (getattr(exchange, "rateLimit", 1000) / 1000.0) * RATE_LIMIT_SAFETY
 
     while since < now_ms:
-        check_escape()
-        if stop_flag:
-            break
-
         t0 = time.time()
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME,
@@ -500,7 +453,7 @@ def verify_data(csv_file: str) -> bool:
     if "timestamp" not in df.columns or "close" not in df.columns:
         print("Il file non contiene colonne 'timestamp' o 'close' valide.")
         return False
-
+    print("Controllo il formato dei timestamp...")
     # Controllo formato timestamp
     def check_ts_format(ts):
         try:
@@ -512,7 +465,7 @@ def verify_data(csv_file: str) -> bool:
     if not df["timestamp"].apply(check_ts_format).all():
         print("Alcuni timestamp non sono nel formato corretto.")
         return False
-
+    else: print("I timestamp sono nel formato corretto. Controllo i gap...")
     timestamps = pd.to_datetime(df["timestamp"], format="%d/%m/%Y %H:%M")
     diffs = timestamps.diff().dropna()
 
@@ -532,7 +485,7 @@ def verify_data(csv_file: str) -> bool:
             prev_time = timestamps[idx - 1].strftime("%d/%m/%Y %H:%M")
             curr_time = timestamps[idx].strftime("%d/%m/%Y %H:%M")
             print("f[{csv_file}]: C'è un gap temporale di {gap_min} minuti tra la data {prev_time} e la data {curr_time}")
-            debug_print(f"[{csv_file}]: C'è un gap temporale di {gap_min} minuti tra la data {prev_time} e la data {curr_time}")
+            dprint(f"[{csv_file}]: C'è un gap temporale di {gap_min} minuti tra la data {prev_time} e la data {curr_time}")
 
         if total_gaps > 10:
             print(f"E altri {total_gaps - 10} gaps")
@@ -541,11 +494,11 @@ def verify_data(csv_file: str) -> bool:
                     gap_min = int(gaps[idx].total_seconds() / 60)
                     prev_time = timestamps[idx - 1].strftime("%d/%m/%Y %H:%M")
                     curr_time = timestamps[idx].strftime("%d/%m/%Y %H:%M")
-                    debug_print(f"[{csv_file}]: C'è un gap temporale di {gap_min} minuti tra la data {prev_time} e la data {curr_time}")
+                    dprint(f"[{csv_file}]: C'è un gap temporale di {gap_min} minuti tra la data {prev_time} e la data {curr_time}")
 
         return False
 
-    print("Nessun problema trovato nei timestamp.")
+    print("Nessun problema trovato nei gap.")
     return True
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -579,8 +532,8 @@ def restore_from_gaps(csv_file: str, exchange: ccxt.Exchange) -> None:
             dates_to_remove.add(current)
             current += timedelta(days=1)
     
-    debug_print(f"Date con gap da riparare: {', '.join(str(d) for d in sorted(dates_to_remove))}")
-    
+    dprint(f"Date con gap da riparare: {', '.join(str(d) for d in sorted(dates_to_remove))}")
+    print ("Trovati gap. Inizio restore...")
     # Converte csv completo in parziale
     partial_csv = csv_file.replace(".csv", "_partial.csv")
     full_to_partial_conversion(csv_file, partial_csv)
@@ -594,7 +547,7 @@ def restore_from_gaps(csv_file: str, exchange: ccxt.Exchange) -> None:
     df_partial.drop(columns=["date"], inplace=True)
     
     # Debug stato rimozione date
-    if DEBUG: debug_print("Rimozione date con gap dal parziale", partial_csv, dates=sorted(dates_to_remove), rows_count=len(df_partial))
+    dprint("Rimozione date con gap dal parziale", partial_csv, dates=sorted(dates_to_remove), rows_count=len(df_partial))
     
     # Riscrivi parziale pulito
     df_partial.to_csv(partial_csv, index=False, sep=";")
@@ -641,8 +594,8 @@ def restore_from_gaps(csv_file: str, exchange: ccxt.Exchange) -> None:
         
         if buffer:
             save_partial(buffer, partial_csv)
-            if DEBUG: debug_print(f"Download completato per data {dt}, {partial_csv}")
-            if DEBUGDF: debug_print(f"{buffer}")
+            dprint(f"Download completato per data {dt}, {partial_csv}")
+            if DEBUGDF: dprint(f"{buffer}")
     
     # Riconverti in csv completo
     convert_btc = "/BTC" in symbol # type: ignore
@@ -657,11 +610,11 @@ def restore_from_gaps(csv_file: str, exchange: ccxt.Exchange) -> None:
                 load_btc_csv_thread.start()
             consolidate_csv(csv_file, partial_csv, convert_btc)
     else: consolidate_csv(csv_file, partial_csv, convert_btc)
-    if DEBUG: (f"Consolidamento completato {csv_file}")
+    dprint(f"Consolidamento completato {csv_file}")
     if RestoreSkipped:
         print(f"Ripristino fallito per {csv_file}(BTC.csv completo mancante!)\n")
     else:
-        print(f"Ripristino completato per {csv_file}")
+        print(f"Ripristino completato per {csv_file}\n")
 # ────────────────────────────────────────────────────────────────────────────────
 # Restore manuale
 # ────────────────────────────────────────────────────────────────────────────────
@@ -709,7 +662,7 @@ def force_restore_gaps(csv_file: str) -> None:
             })
             current_ts += increment
 
-        debug_print(f"Gap tra {ts_start} e {ts_end} riempito con valore {last_price}")
+        dprint(f"Gap tra {ts_start} e {ts_end} riempito con valore {last_price}")
 
     # Step 4: Aggiungi righe al parziale
     if new_rows:
@@ -723,7 +676,7 @@ def force_restore_gaps(csv_file: str) -> None:
         print(f"Gap riempiti nel parziale: {partial_csv}")
 
         if DEBUGDF:
-            debug_print(df_filled.head())
+            dprint(df_filled.head())
     else:
         print("Nessun dato aggiunto al parziale.")
 
@@ -752,125 +705,96 @@ def force_restore_gaps(csv_file: str) -> None:
 # MAIN
 # ────────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Downloader OHLCV da Binance e Cryptocom"
-    )
-    parser.add_argument(
-        "-format", action="store_true",
-        help="Formatta i file parziali in file completi"
-    )
-    parser.add_argument(
-        "-verify", action="store_true",
-        help="Verifica integrità dati dei file CSV completi"
-    )
-    parser.add_argument(
-        "-restore", action="store_true",
-        help="Ripara gap nei file CSV completi riscaricando i dati mancanti"
-    )
-    parser.add_argument(
-        "-auto", action="store_true",
-        help="Modalità download automatica(Skip input utente)"
-    )
-    parser.add_argument(
-        "-forcerestore", action="store_true",
-        help="Ripristina i gap temporali nei file CSV inserendo righe mancanti con l'ultimo prezzo noto fino al timestamp successivo disponibile."
-    )
-    args = parser.parse_args()
+    try:
+        parser = argparse.ArgumentParser(
+            description="Downloader OHLCV da Binance e Cryptocom"
+        )
+        parser.add_argument(
+            "-format", action="store_true",
+            help="Formatta i file parziali in file completi"
+        )
+        parser.add_argument(
+            "-verify", nargs="?", const=True,
+            help="Verifica integrità dati dei file CSV completi. Puoi definire un csv da verificare."
+        )
+        parser.add_argument(
+            "-restore", nargs="?", const=True,
+            help="Ripara gap nei file CSV completi riscaricando i dati mancanti. Puoi definire un csv da riparare"
+        )
+        parser.add_argument(
+            "-auto", action="store_true",
+            help="Modalità download automatica(Skip input utente)"
+        )
+        parser.add_argument(
+            "-forcerestore", nargs="?", const=True,
+            help="Ripristina i gap temporali nei file CSV inserendo righe mancanti con l'ultimo prezzo noto fino al timestamp successivo disponibile. Puoi definire un csv da riparare."
+        )
+        args = parser.parse_args()
 
-    if args.format:
-        format_all_partials()
-        sys.exit(0)
-    
-    if args.verify:
-                # verifica file CSV completi
-        csv_files = [f for f in glob.glob("*.csv") if "_partial" not in f]
-        if not csv_files:
-            print("Nessun file CSV completo trovato per la verifica.")
-            sys.exit(0)
+        def get_csv(input_arg: Optional[str], exchanges: dict) -> List[Path]:
+            #Restituisce la lista di file CSV validi da processare.
+            if isinstance(input_arg, str):
+                p = Path(input_arg)
+                if p.is_file():
+                    csv_files = [p]
+                else:
+                    dprint(f"Il file specificato non esiste: {input_arg}", level="e")
+            else:
+                csv_files = [f for f in Path('.').glob("*.csv") if "_partial" not in f.name]
+                if not csv_files:
+                    print("Nessun file CSV completo trovato.")
+                    sys.exit(1)
+                csv_files.sort(key=lambda f: 0 if f.name == "BTC.csv" else 1)
 
-        valid_bases = {sym.split("/")[0] for syms in exchanges.values() for sym in syms}
-        csv_files = [f for f in csv_files if f[:-4] in valid_bases]
-
-        if not csv_files:
-            print("Nessun file CSV valido da verificare.")
-            sys.exit(0)
-
-        all_ok = True
-        for csv_file in csv_files:
-            if not verify_data(csv_file):
-                all_ok = False
-        if all_ok:
-            print("\nTutti i file CSV sono consistenti.")
-        else:
-            print("\nAlcuni file CSV presentano anomalie. Usa -restore per risolvere le anomalie.")
-        sys.exit(0)
+            valid_bases = {sym.split("/")[0] for syms in exchanges.values() for sym in syms}
+            csv_files = [f for f in csv_files if f.stem in valid_bases]
+            if not csv_files:
+                print ("Nessun file CSV con coppia valida trovato.")
+                sys.exit(1)
+            return csv_files
         
-    if args.restore:
-        csv_files = [f for f in glob.glob("*.csv") if "_partial" not in f]
-        valid_bases = {sym.split("/")[0] for syms in exchanges.values() for sym in syms}
-        csv_files = [f for f in csv_files if f[:-4] in valid_bases]
-
-        if not csv_files:
-            print("Nessun file CSV valido da riparare.")
+        if args.format:
+            print("Premi CTRL+C per interrompere l'operazione.\n")
+            format_all_partials()
             sys.exit(0)
-
-        base_to_exchange = {}
-        for exch, syms in exchanges.items():
-            for sym in syms:
-                base = sym.split("/")[0]
-                base_to_exchange[base] = exch
-
-        for csv_file in csv_files:
-            base = csv_file[:-4]
-            exch = base_to_exchange.get(base)
-            if not exch:
-                print(f"Exchange non trovato per {csv_file}, skip.")
-                continue
-            restore_from_gaps(csv_file, exch)
-
-        print("Ripristino completato per tutti i file.")
-        sys.exit(0)
-    
-    if args.auto:
-        print("Premi Ctrl+E per interrompere l'operazione.\n")
-        skipanswer = True
-        try:
-            for exch, symbols in exchanges.items():
-                for sym in symbols:
-                    result = download_symbol(exch, sym)
-                    if not result:
-                        print("\nDownload interrotto dall'utente.")
-                        sys.exit(0)
-            print("\nDownload completato!")
-        except KeyboardInterrupt:
-            print("\nEsecuzione interrotta dall'utente.")
+        
+        if args.verify:
+            print("Premi CTRL+C per interrompere l'operazione.\n")
+            # verifica file CSV completi
+            csv_files = get_csv(args.verify, exchanges)
+            all_ok = True
+            for csv_file in csv_files:
+                if not verify_data(csv_file):
+                    all_ok = False
+            if all_ok:
+                print("\nTutti i file CSV sono consistenti.")
+            else:
+                print("\nAlcuni file CSV presentano anomalie. Usa -restore per risolvere le anomalie.")
             sys.exit(0)
             
-    if args.forcerestore:
-        csv_files = [f for f in glob.glob("*.csv") if "_partial" not in f]
-        if not csv_files:
-            print("Nessun file CSV completo trovato per la verifica.")
-            sys.exit(0)
+        if args.restore:
+            print("Premi CTRL+C per interrompere l'operazione.\n")
+            csv_files = get_csv(args.restore, exchanges)
+            base_to_exchange = {}
+            for exch, syms in exchanges.items():
+                for sym in syms:
+                    base = sym.split("/")[0]
+                    base_to_exchange[base] = exch
 
-        valid_bases = {sym.split("/")[0] for syms in exchanges.values() for sym in syms}
-        csv_files = [f for f in csv_files if f[:-4] in valid_bases]
+            for csv_file in csv_files:
+                base = csv_file.stem
+                exch = base_to_exchange.get(base)
+                if not exch:
+                    print(f"Exchange non trovato per {csv_file}, skip.")
+                    continue
+                restore_from_gaps(csv_file, exch)
 
-        if not csv_files:
-            print("Nessun file CSV valido da verificare.")
+            print("Ripristino completato per tutti i file.")
             sys.exit(0)
         
-        print("Ripristina i gap temporali nei file CSV inserendo righe mancanti con l'ultimo prezzo noto\nfino al timestamp successivo disponibile.")
-        approve = input("Vuoi proseguire? s/n: ").strip().lower()
-        if approve != "s": sys.exit(0)
-        for csv_file in csv_files:
-            force_restore_gaps(csv_file)
-        print("Ripristino completato.")
-        sys.exit(0)
-    
-    #Senza argomenti parte il downloader.
-    if not (args.auto) and not (args.restore) and not (args.verify) and not (args.format) and not(args.forcerestore):
-        print("Premi Ctrl+E per interrompere l'operazione.\n")
-        try:
+        if args.auto:
+            print("Premi CTRL+C per interrompere l'operazione.\n")
+            skipanswer = True
             for exch, symbols in exchanges.items():
                 for sym in symbols:
                     result = download_symbol(exch, sym)
@@ -878,6 +802,29 @@ if __name__ == "__main__":
                         print("\nDownload interrotto dall'utente.")
                         sys.exit(0)
             print("\nDownload completato!")
-        except KeyboardInterrupt:
-            print("\nEsecuzione interrotta dall'utente.")
+                
+        if args.forcerestore:
+            csv_files = get_csv(args.forcerestore, exchanges)
+            print("Ripristina i gap temporali nei file CSV inserendo righe mancanti con l'ultimo prezzo noto\nfino al timestamp successivo disponibile.")
+            approve = input("Vuoi proseguire? s/n: ").strip().lower()
+            if approve != "s": sys.exit(0)
+            print("Premi CTRL+C per interrompere l'operazione.\n")
+            for csv_file in csv_files:
+                force_restore_gaps(csv_file)
+            print("Ripristino completato.")
             sys.exit(0)
+        
+        #Senza argomenti parte il downloader.
+        if not (args.auto) and not (args.restore) and not (args.verify) and not (args.format) and not(args.forcerestore):
+            print("Premi CTRL+C per interrompere l'operazione.\n")
+            for exch, symbols in exchanges.items():
+                for sym in symbols:
+                    result = download_symbol(exch, sym)
+                    if not result:
+                        print("\nDownload interrotto dall'utente.")
+                        sys.exit(0)
+            print("\nDownload completato!")
+            
+    except KeyboardInterrupt:
+        print("\nEsecuzione interrotta dall'utente.")
+        sys.exit(0)
