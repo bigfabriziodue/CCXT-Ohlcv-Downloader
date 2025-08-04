@@ -3,7 +3,6 @@ import pandas as pd
 import os
 import time
 import sys
-import msvcrt
 import shutil
 import ctypes
 import argparse
@@ -24,11 +23,16 @@ START_DATE = "2021-12-31 23:00:00" #Data di inizio in formato UTC
 
 BINANCE_SYMBOLS: List[str] = [        #Simboli da scaricare usando Binance
     "BTC/EUR",
-    "BAT/BTC"
+    "ETH/EUR",
+    "XRP/EUR",
+    "SOL/EUR",
+    "BNB/EUR",
+    "DOGE/EUR",
+    "BAT/BTC",
 ]
 
 CRYPTOCOM_SYMBOLS: List[str] = [         #Simboli da scaricare usando Crypto.com
-
+    "CRO/BTC",
 ]
 
 BATCH_LIMIT       = 1000  #Dimensione massima per fetch_ohlcv
@@ -103,12 +107,10 @@ exchanges = {binance: BINANCE_SYMBOLS, cryptocom: CRYPTOCOM_SYMBOLS}
 
 total_pairs = sum(len(syms) for syms in exchanges.values())
 current_pair_idx = 0
-stop_flag = False
 printed_lines = 0
 skipanswer = False
 last_symbol: str | None = None
 last_timestamp_str: str | None = None
-btc_df= None
 btc_df_lock = threading.Lock()
 btc_price_dict = {}
 # ────────────────────────────────────────────────────────────────────────────────
@@ -133,7 +135,8 @@ def progress_print(lines: List[str]) -> None:
 def load_btc_csv():
     dprint("Thread Load CSV BTC avviato!")
     try:
-        global btc_df, btc_price_dict
+        global btc_price_dict
+        btc_df= None
         path = os.path.join(os.path.dirname(__file__), "BTC.csv")
         df = pd.read_csv(path, sep=";", dtype={"timestamp": str})
         with btc_df_lock:
@@ -149,6 +152,15 @@ def load_btc_csv():
         dprint("Non sono riuscito a caricare il CSV di BTC:\n" + str(e), level="e")
 
 load_btc_csv_thread = Thread(target = load_btc_csv)
+
+def btc_thread_start():
+    if (btc_price_dict is None or not btc_price_dict) and not load_btc_csv_thread.is_alive():
+        load_btc_csv_thread.start()
+
+def btc_check_thread():
+    if load_btc_csv_thread.is_alive():
+        dprint("Attendo caricamento CSV BTC...")
+        load_btc_csv_thread.join()
 # ────────────────────────────────────────────────────────────────────────────────
 # Utility lettura/scrittura CSV
 # ────────────────────────────────────────────────────────────────────────────────
@@ -192,6 +204,8 @@ def save_partial(buffer: list, partial_csv: str) -> None:
 # Consolidamento: parziale → completo
 # ────────────────────────────────────────────────────────────────────────────────
 def consolidate_csv(full_csv: str, partial_csv: str, convert_btc: bool) -> None:
+    if convert_btc:
+        btc_thread_start()
     try:
         print(f"Consolidamento in corso: {partial_csv} → {full_csv}...")
 
@@ -221,9 +235,7 @@ def consolidate_csv(full_csv: str, partial_csv: str, convert_btc: bool) -> None:
         if (BREAKPOINT): input("Breakpoint")
 
         if convert_btc:
-            if load_btc_csv_thread.is_alive():
-                dprint("Attendo caricamento CSV BTC...")
-                load_btc_csv_thread.join()
+            btc_check_thread()
                 
             df_all["btc_price"] = df_all["timestamp"].map(btc_price_dict)
             missing_ts = df_all.loc[df_all["btc_price"].isna(), "timestamp"].unique()
@@ -259,12 +271,12 @@ def full_to_partial_conversion(full_csv: str, partial_csv: str) -> int:
         print(f"Conversione {full_csv} → {partial_csv} (ripartenza)...")
         convert_btc = ("BAT" in full_csv) or ("CRO" in full_csv)
         if convert_btc:
-            BTCData = glob.glob("BTC.csv")
+            BTCData = Path("BTC.csv")
             if not BTCData:
                 raise FileNotFoundError(f"Per riprende {full_csv} è necessario un csv di BTC completo!")
-            if (btc_df is None or btc_df.empty) and not load_btc_csv_thread.is_alive():
-                load_btc_csv_thread.start()
+            btc_thread_start()
         df_full = pd.read_csv(full_csv, sep=";")
+        df_full = df_full.drop_duplicates(subset=["timestamp"])
         df_full["timestamp"] = pd.to_datetime(
             df_full["timestamp"],
             format="%d/%m/%Y %H:%M",
@@ -274,9 +286,7 @@ def full_to_partial_conversion(full_csv: str, partial_csv: str) -> int:
         if (DEBUGDF): dprint("Dopo conversione df_full",df_full.head(3))
         df_full.dropna(subset=["timestamp"], inplace=True)
         if convert_btc:
-            if load_btc_csv_thread.is_alive():
-                dprint("Attendo Thread BTC per riconversione EUR→BTC...")
-                load_btc_csv_thread.join()
+            btc_check_thread()
             df_full["ts_str"] = df_full["timestamp"].dt.strftime('%d/%m/%Y %H:%M')
             df_full["btc_price"] = df_full["ts_str"].map(btc_price_dict)
             df_full["close"] = df_full["close"].str.replace(",", ".").astype(float)
@@ -302,7 +312,7 @@ def full_to_partial_conversion(full_csv: str, partial_csv: str) -> int:
 # Download singolo simbolo
 # ────────────────────────────────────────────────────────────────────────────────
 def download_symbol(exchange: ccxt.Exchange, symbol: str) -> bool:
-    global current_pair_idx, stop_flag, last_symbol, last_timestamp_str
+    global current_pair_idx, last_symbol, last_timestamp_str
     
     if timeframe_ms is None: raise ValueError(f"Timeframe non supportato: {TIMEFRAME}")
 
@@ -310,8 +320,7 @@ def download_symbol(exchange: ccxt.Exchange, symbol: str) -> bool:
     last_symbol = symbol
     last_timestamp_str = None
     convert_btc = "/BTC" in symbol
-    if convert_btc and (btc_df is None or btc_df.empty) and not load_btc_csv_thread.is_alive():
-        load_btc_csv_thread.start()
+    if convert_btc: btc_thread_start()
 
     base = symbol.split("/")[0]
     full_csv    = f"{base}.csv"
@@ -402,11 +411,6 @@ def download_symbol(exchange: ccxt.Exchange, symbol: str) -> bool:
         elapsed = time.time() - t0
         time.sleep(max(0.0, rate_limit_s - elapsed))
 
-    if stop_flag:
-        if buffer:
-            save_partial(buffer, partial_csv)
-        return False
-
     if buffer:
         save_partial(buffer, partial_csv)
 
@@ -419,7 +423,7 @@ def download_symbol(exchange: ccxt.Exchange, symbol: str) -> bool:
 # ────────────────────────────────────────────────────────────────────────────────
 def format_all_partials() -> None:
     ConvertSkipped = False
-    partial_files = glob.glob("*_partial.csv")
+    partial_files = Path("*_partial.csv")
     if not partial_files:
         print("Nessun file parziale da formattare trovato.")
         return
@@ -428,13 +432,12 @@ def format_all_partials() -> None:
         full_csv = f"{base}.csv"
         convert_btc = ("BAT" in base) or ("CRO" in base)
         if convert_btc:
-                BTCData = glob.glob("BTC.csv")
+                BTCData = Path("BTC.csv")
                 if not BTCData:
                     print(f"Per formattare {base} è necessario un csv di BTC completo!")
                     ConvertSkipped = True
                     continue  # salta questo file
-                if (btc_df is None or btc_df.empty) and not load_btc_csv_thread.is_alive():
-                    load_btc_csv_thread.start()
+                btc_thread_start()
         consolidate_csv(full_csv, partial_csv, convert_btc)
     if ConvertSkipped: 
         print("Formattazione completata per i file parziali(Saltati CRO/BAT, csv BTC mancante.).")
@@ -484,7 +487,7 @@ def verify_data(csv_file: str) -> bool:
             gap_min = int(gaps[idx].total_seconds() / 60)
             prev_time = timestamps[idx - 1].strftime("%d/%m/%Y %H:%M")
             curr_time = timestamps[idx].strftime("%d/%m/%Y %H:%M")
-            print("f[{csv_file}]: C'è un gap temporale di {gap_min} minuti tra la data {prev_time} e la data {curr_time}")
+            print(f"[{csv_file}]: C'è un gap temporale di {gap_min} minuti tra la data {prev_time} e la data {curr_time}")
             dprint(f"[{csv_file}]: C'è un gap temporale di {gap_min} minuti tra la data {prev_time} e la data {curr_time}")
 
         if total_gaps > 10:
@@ -606,8 +609,7 @@ def restore_from_gaps(csv_file: str, exchange: ccxt.Exchange) -> None:
             print(f"Per ripristinare {base} è necessario un csv di BTC completo!")
             RestoreSkipped = True
         else:
-            if (btc_df is None or btc_df.empty) and not load_btc_csv_thread.is_alive():
-                load_btc_csv_thread.start()
+            btc_thread_start()
             consolidate_csv(csv_file, partial_csv, convert_btc)
     else: consolidate_csv(csv_file, partial_csv, convert_btc)
     dprint(f"Consolidamento completato {csv_file}")
@@ -685,13 +687,12 @@ def force_restore_gaps(csv_file: str) -> None:
     RestoreSkipped = False
 
     if convert_btc:
-        BTCData = glob.glob("BTC.csv")
+        BTCData = Path("BTC.csv")
         if not BTCData:
             print(f"Per ripristinare {csv_file} è necessario un csv di BTC completo!")
             RestoreSkipped = True
         else:
-            if (btc_df is None or btc_df.empty) and not load_btc_csv_thread.is_alive():
-                load_btc_csv_thread.start()
+            btc_thread_start()
             consolidate_csv(csv_file, partial_csv, convert_btc)
     else:
         consolidate_csv(csv_file, partial_csv, convert_btc)
@@ -815,7 +816,7 @@ if __name__ == "__main__":
             sys.exit(0)
         
         #Senza argomenti parte il downloader.
-        if not (args.auto) and not (args.restore) and not (args.verify) and not (args.format) and not(args.forcerestore):
+        if not any([args.auto, args.restore, args.verify, args.format, args.forcerestore]):
             print("Premi CTRL+C per interrompere l'operazione.\n")
             for exch, symbols in exchanges.items():
                 for sym in symbols:
