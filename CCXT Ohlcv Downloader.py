@@ -14,6 +14,16 @@ from datetime import timedelta
 from threading import Thread
 from typing import Optional
 from pathlib import Path
+from packaging import version
+
+def check_pandas_version():
+    if version.parse(pd.__version__) >= version.parse("3.0.0"):
+        print("ATTENZIONE: pandas 3.x non supportato.")
+        print(f"Versione attuale: {pd.__version__}")
+        print("Usa: pip install pandas==2.3.3")
+        sys.exit(1)
+
+check_pandas_version()
 
 # ────────────────────────────────────────────────────────────────────────────────
 # CONFIGURAZIONE MODIFICABILE
@@ -291,7 +301,7 @@ def full_to_partial_conversion(full_csv: str, partial_csv: str) -> int:
             df_full["btc_price"] = df_full["ts_str"].map(btc_price_dict)
             df_full["close"] = df_full["close"].str.replace(",", ".").astype(float)
             df_full["close"] = df_full["close"] / df_full["btc_price"].astype(float)
-            df_full.dropna(subset=["close", "btc_price"], inplace=True)
+            df_full.dropna(subset=["btc_price"], inplace=True)
             
             df_full["timestamp"] = (df_full["timestamp"].astype(int) // 10**6)
             df_full.dropna(subset=["timestamp"], inplace=True)
@@ -507,9 +517,10 @@ def verify_data(csv_file: str) -> bool:
 # ────────────────────────────────────────────────────────────────────────────────
 # Funzione di restore.
 # ────────────────────────────────────────────────────────────────────────────────
-def restore_from_gaps(csv_file: str, exchange: ccxt.Exchange) -> None:
+def restore_from_gaps(csv_file: Path, exchange: ccxt.Exchange) -> None:
     print(f"Ripristino dati per: {csv_file}")
     df = pd.read_csv(csv_file, sep=";")
+    csv_file = str(csv_file)
     
     # Identifica gap come in verify_data ma salvando le date con gap
     timestamps = pd.to_datetime(df["timestamp"], format="%d/%m/%Y %H:%M")
@@ -620,8 +631,9 @@ def restore_from_gaps(csv_file: str, exchange: ccxt.Exchange) -> None:
 # ────────────────────────────────────────────────────────────────────────────────
 # Restore manuale
 # ────────────────────────────────────────────────────────────────────────────────
-def force_restore_gaps(csv_file: str) -> None:
+def force_restore_gaps(csv_file: Path) -> None:
     print(f"\nForzo il restore dei gap per: {csv_file}")
+    csv_file = str(csv_file)
 
     # Step 1: Conversione completo → parziale
     partial_csv = csv_file.replace(".csv", "_partial.csv")
